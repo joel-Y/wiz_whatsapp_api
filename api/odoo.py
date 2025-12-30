@@ -129,13 +129,24 @@ class handler(BaseHTTPRequestHandler):
                         'error': 'Phone number is required'
                     }
                 else:
-                    # Try multiple phone formats
+                    # Search in both phone and mobile fields
+                    # Try phone field first
                     customers = odoo['models'].execute_kw(
                         odoo['db'], odoo['uid'], odoo['password'],
                         'res.partner', 'search_read',
-                        [[['|', ['phone', 'ilike', phone], ['mobile', 'ilike', phone]]]],
+                        [[['phone', 'ilike', phone]]],
                         {'fields': ['id', 'name', 'email', 'phone', 'mobile', 'street', 'city', 'country_id'], 'limit': 5}
                     )
+                    
+                    # If not found, try mobile field
+                    if not customers:
+                        customers = odoo['models'].execute_kw(
+                            odoo['db'], odoo['uid'], odoo['password'],
+                            'res.partner', 'search_read',
+                            [[['mobile', 'ilike', phone]]],
+                            {'fields': ['id', 'name', 'email', 'phone', 'mobile', 'street', 'city', 'country_id'], 'limit': 5}
+                        )
+                    
                     result = {
                         'success': True,
                         'action': 'search_customer',
