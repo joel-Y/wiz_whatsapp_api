@@ -3,36 +3,102 @@ import json
 import xmlrpc.client
 import os
 
-# Odoo Configuration - SECURE: Using Environment Variables
-ODOO_URL = os.environ.get('ODOO_URL', 'https://wizsmith.com')
-ODOO_DB = os.environ.get('ODOO_DB', 'Wiz')
-ODOO_USERNAME = os.environ.get('ODOO_USERNAME')
-ODOO_PASSWORD = os.environ.get('ODOO_PASSWORD')
-
-# Validate that credentials are set
-if not ODOO_USERNAME or not ODOO_PASSWORD:
-    raise ValueError("ODOO_USERNAME and ODOO_PASSWORD must be set as environment variables")
-
-def get_odoo_uid():
-    """Authenticate with Odoo and return UID"""
-    try:
-        common = xmlrpc.client.ServerProxy(f'{ODOO_URL}/xmlrpc/2/common')
-        uid = common.authenticate(ODOO_DB, ODOO_USERNAME, ODOO_PASSWORD, {})
-        if not uid:
-            raise ValueError("Odoo authentication failed - check credentials")
-        return uid
-    except Exception as e:
-        raise Exception(f"Failed to connect to Odoo: {str(e)}")
-
 class handler(BaseHTTPRequestHandler):
     
     def do_OPTIONS(self):
         """Handle CORS preflight requests"""
         self.send_response(200)
         self.send_header('Access-Control-Allow-Origin', '*')
-        self.send_header('Access-Control-Allow-Methods', 'POST, OPTIONS')
+        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
         self.send_header('Access-Control-Allow-Headers', 'Content-Type, X-API-Key')
         self.end_headers()
+    
+    def get_odoo_connection(self):
+        """Get Odoo credentials and authenticate - called per request"""
+        # Get credentials from environment
+        ODOO_URL = os.environ.get('ODOO_URL', 'https://wizsmith.com')
+        ODOO_DB = os.environ.get('ODOO_DB', 'Wiz')
+        ODOO_USERNAME = os.environ.get('ODOO_USERNAME')
+        ODOO_PASSWORD = os.environ.get('ODOO_PASSWORD')
+        
+        # Validate credentials exist
+        if not ODOO_USERNAME or not ODOO_PASSWORD:
+            raise ValueError(f"Missing credentials - Username: {bool(ODOO_USERNAME)}, Password: {bool(ODOO_PASSWORD)}")
+        
+        # Authenticate with Odoo
+        try:
+            common = xmlrpc.client.ServerProxy(f'{ODOO_URL}/xmlrpc/2/common')
+            uid = common.authenticate(ODOO_DB, ODOO_USERNAME, ODOO_PASSWORD, {})
+            
+            if not uid:
+                raise ValueError(f"Authentication failed for user: {ODOO_USERNAME} on database: {ODOO_DB}")
+            
+            models = xmlrpc.client.ServerProxy(f'{ODOO_URL}/xmlrpc/2/object')
+            
+            return {
+                'uid': uid,
+                'models': models,
+                'url': ODOO_URL,
+                'db': ODOO_DB,
+                'password': ODOO_PASSWORD
+            }
+            
+        except Exception as e:
+            raise Exception(f"Odoo connection failed: {str(e)}")
+    
+    def do_GET(self):
+        """Health check endpoint"""
+        try:
+            # Get credentials
+            ODOO_URL = os.environ.get('ODOO_URL', 'https://wizsmith.com')
+            ODOO_DB = os.environ.get('ODOO_DB', 'Wiz')
+            ODOO_USERNAME = os.environ.get('ODOO_USERNAME')
+            ODOO_PASSWORD = os.environ.get('ODOO_PASSWORD')
+            
+            credentials_set = bool(ODOO_URL and ODOO_DB and ODOO_USERNAME and ODOO_PASSWORD)
+            
+            # Try to authenticate if credentials are set
+            auth_test = None
+            if credentials_set:
+                try:
+                    common = xmlrpc.client.ServerProxy(f'{ODOO_URL}/xmlrpc/2/common')
+                    uid = common.authenticate(ODOO_DB, ODOO_USERNAME, ODOO_PASSWORD, {})
+                    auth_test = {
+                        'authenticated': bool(uid),
+                        'uid': uid if uid else None
+                    }
+                except Exception as e:
+                    auth_test = {
+                        'authenticated': False,
+                        'error': str(e)
+                    }
+            
+            health = {
+                'status': 'ok',
+                'service': 'Odoo API Bridge',
+                'odoo_url': ODOO_URL,
+                'odoo_db': ODOO_DB,
+                'credentials_set': credentials_set,
+                'has_username': bool(ODOO_USERNAME),
+                'has_password': bool(ODOO_PASSWORD),
+                'auth_test': auth_test
+            }
+            
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            self.wfile.write(json.dumps(health, default=str).encode('utf-8'))
+            
+        except Exception as e:
+            error = {
+                'status': 'error',
+                'error': str(e)
+            }
+            self.send_response(500)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps(error).encode('utf-8'))
     
     def do_POST(self):
         """Handle Odoo API requests"""
@@ -48,9 +114,8 @@ class handler(BaseHTTPRequestHandler):
             if not action:
                 raise ValueError("Missing 'action' parameter")
             
-            # Connect to Odoo
-            uid = get_odoo_uid()
-            models = xmlrpc.client.ServerProxy(f'{ODOO_URL}/xmlrpc/2/object')
+            # Connect to Odoo (per request)
+            odoo = self.get_odoo_connection()
             
             result = {}
             
@@ -64,11 +129,12 @@ class handler(BaseHTTPRequestHandler):
                         'error': 'Phone number is required'
                     }
                 else:
-                    customers = models.execute_kw(
-                        ODOO_DB, uid, ODOO_PASSWORD,
+                    # Try multiple phone formats
+                    customers = odoo['models'].execute_kw(
+                        odoo['db'], odoo['uid'], odoo['password'],
                         'res.partner', 'search_read',
-                        [[['phone', 'ilike', phone]]],
-                        {'fields': ['id', 'name', 'email', 'phone', 'street', 'city', 'country_id'], 'limit': 5}
+                        [[['|', ['phone', 'ilike', phone], ['mobile', 'ilike', phone]]]],
+                        {'fields': ['id', 'name', 'email', 'phone', 'mobile', 'street', 'city', 'country_id'], 'limit': 5}
                     )
                     result = {
                         'success': True,
@@ -87,11 +153,11 @@ class handler(BaseHTTPRequestHandler):
                         'error': 'customer_id is required'
                     }
                 else:
-                    customer = models.execute_kw(
-                        ODOO_DB, uid, ODOO_PASSWORD,
+                    customer = odoo['models'].execute_kw(
+                        odoo['db'], odoo['uid'], odoo['password'],
                         'res.partner', 'read',
                         [[int(customer_id)]],
-                        {'fields': ['id', 'name', 'email', 'phone', 'street', 'city', 'zip', 'country_id', 'website']}
+                        {'fields': ['id', 'name', 'email', 'phone', 'mobile', 'street', 'city', 'zip', 'country_id', 'website']}
                     )
                     result = {
                         'success': True,
@@ -105,22 +171,21 @@ class handler(BaseHTTPRequestHandler):
                     'name': request_json.get('opportunity_name', 'WhatsApp Lead'),
                     'contact_name': request_json.get('contact_name'),
                     'phone': request_json.get('phone'),
-                    'email': request_json.get('email'),
+                    'email_from': request_json.get('email'),
                     'description': request_json.get('description', ''),
-                    'source_id': False,
                 }
                 
                 # Remove None values
                 lead_data = {k: v for k, v in lead_data.items() if v is not None and v != ''}
                 
-                if not lead_data.get('phone') and not lead_data.get('email'):
+                if not lead_data.get('phone') and not lead_data.get('email_from'):
                     result = {
                         'success': False,
                         'error': 'Either phone or email is required'
                     }
                 else:
-                    lead_id = models.execute_kw(
-                        ODOO_DB, uid, ODOO_PASSWORD,
+                    lead_id = odoo['models'].execute_kw(
+                        odoo['db'], odoo['uid'], odoo['password'],
                         'crm.lead', 'create',
                         [lead_data]
                     )
@@ -135,11 +200,11 @@ class handler(BaseHTTPRequestHandler):
             elif action == 'list_leads':
                 limit = request_json.get('limit', 10)
                 
-                leads = models.execute_kw(
-                    ODOO_DB, uid, ODOO_PASSWORD,
+                leads = odoo['models'].execute_kw(
+                    odoo['db'], odoo['uid'], odoo['password'],
                     'crm.lead', 'search_read',
                     [[]],
-                    {'fields': ['id', 'name', 'contact_name', 'phone', 'email', 'stage_id', 'expected_revenue', 'create_date'], 
+                    {'fields': ['id', 'name', 'contact_name', 'phone', 'email_from', 'stage_id', 'expected_revenue', 'create_date'], 
                      'limit': int(limit),
                      'order': 'create_date desc'}
                 )
@@ -161,8 +226,8 @@ class handler(BaseHTTPRequestHandler):
                         'error': 'lead_id and stage_id are required'
                     }
                 else:
-                    models.execute_kw(
-                        ODOO_DB, uid, ODOO_PASSWORD,
+                    odoo['models'].execute_kw(
+                        odoo['db'], odoo['uid'], odoo['password'],
                         'crm.lead', 'write',
                         [[int(lead_id)], {'stage_id': int(stage_id)}]
                     )
@@ -182,8 +247,8 @@ class handler(BaseHTTPRequestHandler):
                         'error': 'search_term is required'
                     }
                 else:
-                    products = models.execute_kw(
-                        ODOO_DB, uid, ODOO_PASSWORD,
+                    products = odoo['models'].execute_kw(
+                        odoo['db'], odoo['uid'], odoo['password'],
                         'product.product', 'search_read',
                         [[['name', 'ilike', search_term], ['sale_ok', '=', True]]],
                         {'fields': ['id', 'name', 'list_price', 'qty_available', 'default_code'], 'limit': 10}
@@ -197,8 +262,8 @@ class handler(BaseHTTPRequestHandler):
             
             # ===== ACTION: Get Lead Stages =====
             elif action == 'get_lead_stages':
-                stages = models.execute_kw(
-                    ODOO_DB, uid, ODOO_PASSWORD,
+                stages = odoo['models'].execute_kw(
+                    odoo['db'], odoo['uid'], odoo['password'],
                     'crm.stage', 'search_read',
                     [[]],
                     {'fields': ['id', 'name', 'sequence']}
@@ -244,17 +309,3 @@ class handler(BaseHTTPRequestHandler):
             self.send_header('Access-Control-Allow-Origin', '*')
             self.end_headers()
             self.wfile.write(json.dumps(error_result).encode('utf-8'))
-    
-    def do_GET(self):
-        """Health check endpoint"""
-        self.send_response(200)
-        self.send_header('Content-Type', 'application/json')
-        self.send_header('Access-Control-Allow-Origin', '*')
-        self.end_headers()
-        health = {
-            'status': 'ok',
-            'service': 'Odoo API Bridge',
-            'odoo_url': ODOO_URL,
-            'odoo_db': ODOO_DB
-        }
-        self.wfile.write(json.dumps(health).encode('utf-8'))
